@@ -8,6 +8,8 @@ import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
+import eu.kanade.tachiyomi.network.asObservable
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.UnmeteredSource
@@ -18,14 +20,19 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import okhttp3.Credentials
 import okhttp3.Dns
 import okhttp3.Headers
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.Buffer
 import rx.Observable
 import rx.Single
 import rx.android.schedulers.AndroidSchedulers
@@ -33,6 +40,7 @@ import rx.schedulers.Schedulers
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
+import java.util.zip.GZIPInputStream
 
 class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     override val name = "Suwayomi"
@@ -175,9 +183,78 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     class CategorySelect(categoryList: List<CategoryDataClass>) :
         Filter.Select<String>("Category", categoryList.map { it.name }.toTypedArray())
 
+    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
+        // Overriding to use asObservable instead of asObservableSuccess
+        // This allows us to explicitly handle bad responses (404, 500, etc)
+        return if (query.isNotEmpty()) {
+            client.newCall(searchMangaRequest(page, query, filters))
+                .asObservable()
+                .map { response ->
+                    searchMangaParse(response)
+                }
+        } else {
+            super.fetchSearchManga(page, query, filters)
+        }
+    }
+
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+        val request: Request
         if (query.isNotEmpty()) {
-            throw RuntimeException("Only Empty search is supported!")
+            // Construct a list of all manga on the server library by querying every category
+            val mangaList = mutableListOf<MangaDataClass>()
+            categoryList.forEach { category ->
+                val categoryId = category.id
+                val categoryMangaListRequest = GET("$checkedBaseUrl/api/v1/category/$categoryId", headers)
+                val categoryMangaListResponse =
+                    client.newCall(categoryMangaListRequest).execute()
+                val categoryMangaListJson = if ("gzip".equals(
+                        categoryMangaListResponse.header("Content-Encoding"),
+                        ignoreCase = true,
+                    )
+                ) {
+                    val categoryMangaListJsonGzip =
+                        GZIPInputStream(categoryMangaListResponse.body.byteStream())
+                    json.decodeFromString(categoryMangaListJsonGzip.reader().readText())
+                } else {
+                    categoryMangaListResponse.body.string()
+                }
+                val categoryMangaList =
+                    json.decodeFromString<List<MangaDataClass>>(categoryMangaListJson)
+                mangaList.addAll(categoryMangaList)
+            }
+
+            // Filter according to search terms.
+            // Basic substring search, room for improvement.
+            val searchResults = mangaList.filter { mangaData ->
+                val fieldsToCheck = listOf<String?>(
+                    mangaData.title,
+                    mangaData.url,
+                    mangaData.artist,
+                    mangaData.author,
+                    mangaData.description,
+                )
+                fieldsToCheck.any { field ->
+                    when (field) {
+                        is String -> {
+                            field.contains(query, ignoreCase = true)
+                        } else -> {
+                            false
+                        }
+                    }
+                }
+            }.distinct()
+
+            // Package into POST request pointed at root API endpoint. This will 404, but the
+            // resulting Response object will contain the original Request and its data.
+            // This is necessary because (as of this writing) there is no endpoint for searches in
+            // the Tachidesk (Suwayomi) API.
+            val jsonString = json.encodeToString(
+                ListSerializer(MangaDataClass.serializer()),
+                searchResults,
+            )
+            val mediaType = "application/json".toMediaType()
+            val body = jsonString.toRequestBody(mediaType)
+            request = POST("$checkedBaseUrl/api/v1", headers, body)
         } else {
             var selectedFilter = defaultCategoryId
 
@@ -191,11 +268,31 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
                 }
             }
 
-            return GET("$checkedBaseUrl/api/v1/category/$selectedFilter", headers)
+            request = GET("$checkedBaseUrl/api/v1/category/$selectedFilter", headers)
         }
+        return request
     }
 
-    override fun searchMangaParse(response: Response): MangasPage = popularMangaParse(response)
+    override fun searchMangaParse(response: Response): MangasPage {
+        // Extract the manga list from the body of the Response's Request.
+        val buffer = Buffer()
+        response.request.body?.writeTo(buffer)
+        val responseBody = buffer.readUtf8().toResponseBody()
+
+        val newResponse: Response = if (response.request.method.equals("POST", ignoreCase = true)) {
+            // Construct a new Response with the data.
+            Response.Builder()
+                .request(response.request)
+                .protocol(response.protocol)
+                .code(200)
+                .body(responseBody)
+                .message("OK")
+                .build()
+        } else {
+            response
+        }
+        return popularMangaParse(newResponse)
+    }
 
     // ------------- Preferences -------------
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
