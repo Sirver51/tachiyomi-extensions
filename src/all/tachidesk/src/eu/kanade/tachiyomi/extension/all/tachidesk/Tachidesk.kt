@@ -8,8 +8,6 @@ import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
-import eu.kanade.tachiyomi.network.asObservable
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.UnmeteredSource
@@ -29,10 +27,8 @@ import okhttp3.Headers
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
-import okio.Buffer
 import rx.Observable
 import rx.Single
 import rx.android.schedulers.AndroidSchedulers
@@ -183,28 +179,51 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     class CategorySelect(categoryList: List<CategoryDataClass>) :
         Filter.Select<String>("Category", categoryList.map { it.name }.toTypedArray())
 
-    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
-        // Overriding to use asObservable instead of asObservableSuccess
-        // This allows us to explicitly handle bad responses (404, 500, etc)
-        return if (query.isNotEmpty()) {
-            client.newCall(searchMangaRequest(page, query, filters))
-                .asObservable()
-                .map { response ->
-                    searchMangaParse(response)
-                }
-        } else {
-            super.fetchSearchManga(page, query, filters)
-        }
-    }
-
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val request: Request
         if (query.isNotEmpty()) {
+            // Embed search query for processing in searchMangaParse
+            request = Request.Builder()
+                .url("$checkedBaseUrl/api/v1/")
+                .get()
+                .headers(headers)
+                .addHeader("searchQuery", query)
+                .build()
+        } else {
+            var selectedFilter = defaultCategoryId
+
+            filters.forEach { filter ->
+                when (filter) {
+                    is CategorySelect -> {
+                        selectedFilter = categoryList[filter.state].id
+                    }
+                    else -> {
+                    }
+                }
+            }
+
+            request = GET("$checkedBaseUrl/api/v1/category/$selectedFilter", headers)
+        }
+        return request
+    }
+
+    override fun searchMangaParse(response: Response): MangasPage {
+        val request = response.request
+        val newResponse: Response
+        // Check if searchQuery header exists
+        val searchQuery = request.headers["searchQuery"]
+        if (searchQuery != null && searchQuery.isNotEmpty()) {
+            // Get category URL list
+            val categoryUrlList = categoryList.map { category ->
+                val categoryId = category.id
+                "$checkedBaseUrl/api/v1/category/$categoryId"
+            }
+
             // Construct a list of all manga on the server library by querying every category
             val mangaList = mutableListOf<MangaDataClass>()
-            categoryList.forEach { category ->
-                val categoryId = category.id
-                val categoryMangaListRequest = GET("$checkedBaseUrl/api/v1/category/$categoryId", headers)
+            categoryUrlList.forEach { categoryUrl ->
+                val categoryMangaListRequest =
+                    GET(categoryUrl, headers)
                 val categoryMangaListResponse =
                     client.newCall(categoryMangaListRequest).execute()
                 val categoryMangaListJson = if ("gzip".equals(
@@ -236,60 +255,31 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
                 fieldsToCheck.any { field ->
                     when (field) {
                         is String -> {
-                            field.contains(query, ignoreCase = true)
-                        } else -> {
+                            field.contains(searchQuery, ignoreCase = true)
+                        }
+                        else -> {
                             false
                         }
                     }
                 }
             }.distinct()
 
-            // Package into POST request pointed at root API endpoint. This will 404, but the
-            // resulting Response object will contain the original Request and its data.
-            // This is necessary because (as of this writing) there is no endpoint for searches in
-            // the Tachidesk (Suwayomi) API.
+            // Construct new response with search results
             val jsonString = json.encodeToString(
                 ListSerializer(MangaDataClass.serializer()),
                 searchResults,
             )
             val mediaType = "application/json".toMediaType()
-            val body = jsonString.toRequestBody(mediaType)
-            request = POST("$checkedBaseUrl/api/v1", headers, body)
-        } else {
-            var selectedFilter = defaultCategoryId
-
-            filters.forEach { filter ->
-                when (filter) {
-                    is CategorySelect -> {
-                        selectedFilter = categoryList[filter.state].id
-                    }
-                    else -> {
-                    }
-                }
-            }
-
-            request = GET("$checkedBaseUrl/api/v1/category/$selectedFilter", headers)
-        }
-        return request
-    }
-
-    override fun searchMangaParse(response: Response): MangasPage {
-        // Extract the manga list from the body of the Response's Request.
-        val buffer = Buffer()
-        response.request.body?.writeTo(buffer)
-        val responseBody = buffer.readUtf8().toResponseBody()
-
-        val newResponse: Response = if (response.request.method.equals("POST", ignoreCase = true)) {
-            // Construct a new Response with the data.
-            Response.Builder()
-                .request(response.request)
+            val responseBody = jsonString.toResponseBody(mediaType)
+            newResponse = Response.Builder()
+                .request(request)
                 .protocol(response.protocol)
                 .code(200)
                 .body(responseBody)
                 .message("OK")
                 .build()
         } else {
-            response
+            newResponse = response
         }
         return popularMangaParse(newResponse)
     }
