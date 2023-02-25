@@ -18,12 +18,13 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
-import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import okhttp3.Credentials
 import okhttp3.Dns
 import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -36,7 +37,6 @@ import rx.schedulers.Schedulers
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
-import java.util.zip.GZIPInputStream
 
 class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     override val name = "Suwayomi"
@@ -183,12 +183,12 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
         val request: Request
         if (query.isNotEmpty()) {
             // Embed search query for processing in searchMangaParse
-            request = Request.Builder()
-                .url("$checkedBaseUrl/api/v1/")
-                .get()
-                .headers(headers)
-                .addHeader("searchQuery", query)
+            val url = "$checkedBaseUrl/api/v1"
+                .toHttpUrl()
+                .newBuilder()
+                .fragment(query)
                 .build()
+            request = GET(url, headers)
         } else {
             var selectedFilter = defaultCategoryId
 
@@ -210,9 +210,9 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     override fun searchMangaParse(response: Response): MangasPage {
         val request = response.request
         val newResponse: Response
-        // Check if searchQuery header exists
-        val searchQuery = request.headers["searchQuery"]
-        if (searchQuery != null && searchQuery.isNotEmpty()) {
+        // Check if fragment exists
+        val searchQuery = request.url.fragment
+        if (!searchQuery.isNullOrEmpty()) {
             // Get category URL list
             val categoryUrlList = categoryList.map { category ->
                 val categoryId = category.id
@@ -226,17 +226,8 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
                     GET(categoryUrl, headers)
                 val categoryMangaListResponse =
                     client.newCall(categoryMangaListRequest).execute()
-                val categoryMangaListJson = if ("gzip".equals(
-                        categoryMangaListResponse.header("Content-Encoding"),
-                        ignoreCase = true,
-                    )
-                ) {
-                    val categoryMangaListJsonGzip =
-                        GZIPInputStream(categoryMangaListResponse.body.byteStream())
-                    json.decodeFromString(categoryMangaListJsonGzip.reader().readText())
-                } else {
+                val categoryMangaListJson =
                     categoryMangaListResponse.body.string()
-                }
                 val categoryMangaList =
                     json.decodeFromString<List<MangaDataClass>>(categoryMangaListJson)
                 mangaList.addAll(categoryMangaList)
@@ -245,7 +236,7 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
             // Filter according to search terms.
             // Basic substring search, room for improvement.
             val searchResults = mangaList.filter { mangaData ->
-                val fieldsToCheck = listOf<String?>(
+                val fieldsToCheck = listOfNotNull(
                     mangaData.title,
                     mangaData.url,
                     mangaData.artist,
@@ -253,22 +244,12 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
                     mangaData.description,
                 )
                 fieldsToCheck.any { field ->
-                    when (field) {
-                        is String -> {
-                            field.contains(searchQuery, ignoreCase = true)
-                        }
-                        else -> {
-                            false
-                        }
-                    }
+                    field.contains(searchQuery, ignoreCase = true)
                 }
             }.distinct()
 
             // Construct new response with search results
-            val jsonString = json.encodeToString(
-                ListSerializer(MangaDataClass.serializer()),
-                searchResults,
-            )
+            val jsonString = json.encodeToString(searchResults)
             val mediaType = "application/json".toMediaType()
             val responseBody = jsonString.toResponseBody(mediaType)
             newResponse = Response.Builder()
