@@ -122,14 +122,23 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
 
     // ------------- Filters & Search -------------
 
+    private var categoryList: List<CategoryDataClass> = emptyList()
+
+    private val defaultCategoryId: Int
+        get() = categoryList.firstOrNull()?.id ?: 0
+
+    class CategorySelect(categoryList: List<CategoryDataClass>) :
+        Filter.Select<String>("Category", categoryList.map { it.name }.toTypedArray())
+
+    class DisableGlobalSearch() :
+        Filter.CheckBox("Search only current category", false)
+
     override fun getFilterList(): FilterList =
         FilterList(
             CategorySelect(refreshCategoryList(baseUrl).let { categoryList }),
             Filter.Header("Press reset to attempt to fetch categories"),
             DisableGlobalSearch(),
         )
-
-    private var categoryList: List<CategoryDataClass> = emptyList()
 
     private fun refreshCategoryList(baseUrl: String) {
         Single.fromCallable {
@@ -149,74 +158,26 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
             )
     }
 
-    // ------------- Images -------------
-    override fun imageRequest(page: Page) = GET(page.imageUrl!!, headers)
-
-    // ------------- Settings -------------
-
-    private val preferences: SharedPreferences by lazy {
-        Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
-    }
-
-    init {
-        val preferencesMap = mapOf(
-            ADDRESS_TITLE to ADDRESS_DEFAULT,
-            LOGIN_TITLE to LOGIN_DEFAULT,
-            PASSWORD_TITLE to PASSWORD_DEFAULT,
-        )
-
-        preferencesMap.forEach { (key, defaultValue) ->
-            val initBase = preferences.getString(key, defaultValue)!!
-
-            if (initBase.isNotBlank()) {
-                refreshCategoryList(initBase)
-            }
-        }
-    }
-
-    private val defaultCategoryId: Int
-        get() = categoryList.firstOrNull()?.id ?: 0
-
-    class CategorySelect(categoryList: List<CategoryDataClass>) :
-        Filter.Select<String>("Category", categoryList.map { it.name }.toTypedArray())
-
-    class DisableGlobalSearch() :
-        Filter.CheckBox("Search only current category", false)
-
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val request: Request
-        if (query.isNotEmpty()) {
-            // Embed search query and scope into URL params for processing in searchMangaParse
-            var currentCategoryId = defaultCategoryId
-            var disableGlobalSearch = false
-            filters.forEach { filter ->
-                when (filter) {
-                    is CategorySelect -> currentCategoryId = categoryList[filter.state].id
-                    is DisableGlobalSearch -> disableGlobalSearch = filter.state
-                    else -> {}
-                }
+        // Embed search query and scope into URL params for processing in searchMangaParse
+        var currentCategoryId = defaultCategoryId
+        var disableGlobalSearch = false
+        filters.forEach { filter ->
+            when (filter) {
+                is CategorySelect -> currentCategoryId = categoryList[filter.state].id
+                is DisableGlobalSearch -> disableGlobalSearch = filter.state
+                else -> {}
             }
-            val url = "$checkedBaseUrl/api/v1"
-                .toHttpUrl()
-                .newBuilder()
-                .addQueryParameter("searchQuery", query)
-                .addQueryParameter("currentCategoryId", currentCategoryId.toString())
-                .addQueryParameter("disableGlobalSearch", disableGlobalSearch.toString())
-                .build()
-            request = GET(url, headers)
-        } else {
-            var selectedFilter = defaultCategoryId
-
-            filters.forEach { filter ->
-                when (filter) {
-                    is CategorySelect -> selectedFilter = categoryList[filter.state].id
-                    else -> {}
-                }
-            }
-
-            request = GET("$checkedBaseUrl/api/v1/category/$selectedFilter", headers)
         }
-        return request
+        val url = "$checkedBaseUrl/api/v1/$currentCategoryId"
+            .toHttpUrl()
+            .newBuilder()
+            .addQueryParameter("searchQuery", query)
+            .addQueryParameter("currentCategoryId", currentCategoryId.toString())
+            .addQueryParameter("disableGlobalSearch", disableGlobalSearch.toString())
+            .addQueryParameter("page", page.toString())
+            .build()
+        return GET(url, headers)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
@@ -231,7 +192,7 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
             currentCategoryId = request.url.queryParameter("currentCategoryId")?.toIntOrNull()
             disableGlobalSearch = request.url.queryParameter("disableGlobalSearch").toBoolean()
         }
-        if (!searchQuery.isNullOrEmpty()) {
+        newResponse = if (!searchQuery.isNullOrEmpty()) {
             // Get URLs of categories to search
             val categoryUrlList = if (!disableGlobalSearch) {
                 categoryList.map { category ->
@@ -275,7 +236,7 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
             val jsonString = json.encodeToString(searchResults)
             val mediaType = "application/json".toMediaType()
             val responseBody = jsonString.toResponseBody(mediaType)
-            newResponse = Response.Builder()
+            Response.Builder()
                 .request(request)
                 .protocol(response.protocol)
                 .code(200)
@@ -283,9 +244,34 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
                 .message("OK")
                 .build()
         } else {
-            newResponse = response
+            response
         }
         return popularMangaParse(newResponse)
+    }
+
+    // ------------- Images -------------
+    override fun imageRequest(page: Page) = GET(page.imageUrl!!, headers)
+
+    // ------------- Settings -------------
+
+    private val preferences: SharedPreferences by lazy {
+        Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
+    }
+
+    init {
+        val preferencesMap = mapOf(
+            ADDRESS_TITLE to ADDRESS_DEFAULT,
+            LOGIN_TITLE to LOGIN_DEFAULT,
+            PASSWORD_TITLE to PASSWORD_DEFAULT,
+        )
+
+        preferencesMap.forEach { (key, defaultValue) ->
+            val initBase = preferences.getString(key, defaultValue)!!
+
+            if (initBase.isNotBlank()) {
+                refreshCategoryList(initBase)
+            }
+        }
     }
 
     // ------------- Preferences -------------
