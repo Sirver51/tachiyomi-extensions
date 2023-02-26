@@ -80,7 +80,7 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
         GET("$checkedBaseUrl/api/v1/manga/${manga.url}/?onlineFetch=true", headers)
 
     override fun mangaDetailsParse(response: Response): SManga =
-        json.decodeFromString<MangaDataClass>(response.body.string()).let { it.toSManga() }
+        json.decodeFromString<MangaDataClass>(response.body.string()).toSManga()
 
     // ------------- Chapter -------------
 
@@ -126,6 +126,7 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
         FilterList(
             CategorySelect(refreshCategoryList(baseUrl).let { categoryList }),
             Filter.Header("Press reset to attempt to fetch categories"),
+            DisableGlobalSearch(),
         )
 
     private var categoryList: List<CategoryDataClass> = emptyList()
@@ -179,14 +180,28 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     class CategorySelect(categoryList: List<CategoryDataClass>) :
         Filter.Select<String>("Category", categoryList.map { it.name }.toTypedArray())
 
+    class DisableGlobalSearch() :
+        Filter.CheckBox("Search only current category", false)
+
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val request: Request
         if (query.isNotEmpty()) {
-            // Embed search query for processing in searchMangaParse
+            // Embed search query and scope into URL params for processing in searchMangaParse
+            var currentCategoryId = defaultCategoryId
+            var disableGlobalSearch = false
+            filters.forEach { filter ->
+                when (filter) {
+                    is CategorySelect -> currentCategoryId = categoryList[filter.state].id
+                    is DisableGlobalSearch -> disableGlobalSearch = filter.state
+                    else -> {}
+                }
+            }
             val url = "$checkedBaseUrl/api/v1"
                 .toHttpUrl()
                 .newBuilder()
-                .fragment(query)
+                .addQueryParameter("searchQuery", query)
+                .addQueryParameter("currentCategoryId", currentCategoryId.toString())
+                .addQueryParameter("disableGlobalSearch", disableGlobalSearch.toString())
                 .build()
             request = GET(url, headers)
         } else {
@@ -194,11 +209,8 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
 
             filters.forEach { filter ->
                 when (filter) {
-                    is CategorySelect -> {
-                        selectedFilter = categoryList[filter.state].id
-                    }
-                    else -> {
-                    }
+                    is CategorySelect -> selectedFilter = categoryList[filter.state].id
+                    else -> {}
                 }
             }
 
@@ -210,16 +222,27 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     override fun searchMangaParse(response: Response): MangasPage {
         val request = response.request
         val newResponse: Response
-        // Check if fragment exists
-        val searchQuery = request.url.fragment
+        var searchQuery: String? = ""
+        var currentCategoryId: Int? = defaultCategoryId
+        var disableGlobalSearch = false
+        // Check if URL has query params and parse them
+        if (!request.url.query.isNullOrEmpty()) {
+            searchQuery = request.url.queryParameter("searchQuery")
+            currentCategoryId = request.url.queryParameter("currentCategoryId")?.toIntOrNull()
+            disableGlobalSearch = request.url.queryParameter("disableGlobalSearch").toBoolean()
+        }
         if (!searchQuery.isNullOrEmpty()) {
-            // Get category URL list
-            val categoryUrlList = categoryList.map { category ->
-                val categoryId = category.id
-                "$checkedBaseUrl/api/v1/category/$categoryId"
+            // Get URLs of categories to search
+            val categoryUrlList = if (!disableGlobalSearch) {
+                categoryList.map { category ->
+                    val categoryId = category.id
+                    "$checkedBaseUrl/api/v1/category/$categoryId"
+                }
+            } else {
+                listOfNotNull("$checkedBaseUrl/api/v1/category/$currentCategoryId")
             }
 
-            // Construct a list of all manga on the server library by querying every category
+            // Construct a list of all manga in the required categories by querying each one
             val mangaList = mutableListOf<MangaDataClass>()
             categoryUrlList.forEach { categoryUrl ->
                 val categoryMangaListRequest =
