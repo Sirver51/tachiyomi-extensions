@@ -19,17 +19,14 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import okhttp3.Credentials
 import okhttp3.Dns
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-import okhttp3.ResponseBody.Companion.toResponseBody
 import rx.Observable
 import rx.Single
 import rx.android.schedulers.AndroidSchedulers
@@ -37,6 +34,7 @@ import rx.schedulers.Schedulers
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
+import kotlin.math.min
 
 class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     override val name = "Suwayomi"
@@ -64,16 +62,13 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
 
     // ------------- Popular Manga -------------
 
+    // Route the popular manga view through search to avoid duplicate code path
     override fun popularMangaRequest(page: Int): Request =
-        GET("$checkedBaseUrl/api/v1/category/$defaultCategoryId", headers)
+        searchMangaRequest(page, "", FilterList())
 
     override fun popularMangaParse(response: Response): MangasPage =
-        MangasPage(
-            json.decodeFromString<List<MangaDataClass>>(response.body.string()).map {
-                it.toSManga()
-            },
-            false,
-        )
+        searchMangaParse(response)
+
     // ------------- Manga Details -------------
 
     override fun mangaDetailsRequest(manga: SManga) =
@@ -127,17 +122,25 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     private val defaultCategoryId: Int
         get() = categoryList.firstOrNull()?.id ?: 0
 
+    private val resultsPerPageOptions = listOf(10, 15, 20, 25)
+
+    private val defaultResultsPerPage = resultsPerPageOptions.first()
+
     class CategorySelect(categoryList: List<CategoryDataClass>) :
         Filter.Select<String>("Category", categoryList.map { it.name }.toTypedArray())
 
     class DisableGlobalSearch() :
         Filter.CheckBox("Search only current category", false)
 
+    class ResultsPerPageSelect(options: List<Int>) :
+        Filter.Select<Int>("Results per page", options.toTypedArray())
+
     override fun getFilterList(): FilterList =
         FilterList(
             CategorySelect(refreshCategoryList(baseUrl).let { categoryList }),
             Filter.Header("Press reset to attempt to fetch categories"),
             DisableGlobalSearch(),
+            ResultsPerPageSelect(resultsPerPageOptions),
         )
 
     private fun refreshCategoryList(baseUrl: String) {
@@ -162,10 +165,12 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
         // Embed search query and scope into URL params for processing in searchMangaParse
         var currentCategoryId = defaultCategoryId
         var disableGlobalSearch = false
+        var resultsPerPage = defaultResultsPerPage
         filters.forEach { filter ->
             when (filter) {
                 is CategorySelect -> currentCategoryId = categoryList[filter.state].id
                 is DisableGlobalSearch -> disableGlobalSearch = filter.state
+                is ResultsPerPageSelect -> resultsPerPage = resultsPerPageOptions[filter.state]
                 else -> {}
             }
         }
@@ -175,6 +180,7 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
             .addQueryParameter("searchQuery", query)
             .addQueryParameter("currentCategoryId", currentCategoryId.toString())
             .addQueryParameter("disableGlobalSearch", disableGlobalSearch.toString())
+            .addQueryParameter("resultsPerPage", resultsPerPage.toString())
             .addQueryParameter("page", page.toString())
             .build()
         return GET(url, headers)
@@ -182,44 +188,49 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
 
     override fun searchMangaParse(response: Response): MangasPage {
         val request = response.request
-        val newResponse: Response
         var searchQuery: String? = ""
         var currentCategoryId: Int? = defaultCategoryId
         var disableGlobalSearch = false
+        var resultsPerPage: Int? = defaultResultsPerPage
+        var page: Int? = 1
+
         // Check if URL has query params and parse them
         if (!request.url.query.isNullOrEmpty()) {
             searchQuery = request.url.queryParameter("searchQuery")
             currentCategoryId = request.url.queryParameter("currentCategoryId")?.toIntOrNull()
             disableGlobalSearch = request.url.queryParameter("disableGlobalSearch").toBoolean()
+            resultsPerPage = request.url.queryParameter("resultsPerPage")?.toIntOrNull()
+            page = request.url.queryParameter("page")?.toIntOrNull()
         }
-        newResponse = if (!searchQuery.isNullOrEmpty()) {
-            // Get URLs of categories to search
-            val categoryUrlList = if (!disableGlobalSearch) {
-                categoryList.map { category ->
-                    val categoryId = category.id
-                    "$checkedBaseUrl/api/v1/category/$categoryId"
-                }
-            } else {
-                listOfNotNull("$checkedBaseUrl/api/v1/category/$currentCategoryId")
-            }
 
-            // Construct a list of all manga in the required categories by querying each one
-            val mangaList = mutableListOf<MangaDataClass>()
-            categoryUrlList.forEach { categoryUrl ->
-                val categoryMangaListRequest =
-                    GET(categoryUrl, headers)
-                val categoryMangaListResponse =
-                    client.newCall(categoryMangaListRequest).execute()
-                val categoryMangaListJson =
-                    categoryMangaListResponse.body.string()
-                val categoryMangaList =
-                    json.decodeFromString<List<MangaDataClass>>(categoryMangaListJson)
-                mangaList.addAll(categoryMangaList)
+        // Get URLs of categories to search
+        val categoryUrlList = if (!disableGlobalSearch && !searchQuery.isNullOrEmpty()) {
+            categoryList.map { category ->
+                val categoryId = category.id
+                "$checkedBaseUrl/api/v1/category/$categoryId"
             }
+        } else {
+            listOfNotNull("$checkedBaseUrl/api/v1/category/$currentCategoryId")
+        }
 
-            // Filter according to search terms.
-            // Basic substring search, room for improvement.
-            val searchResults = mangaList.filter { mangaData ->
+        // Construct a list of all manga in the required categories by querying each one
+        val mangaList = mutableListOf<MangaDataClass>()
+        categoryUrlList.forEach { categoryUrl ->
+            val categoryMangaListRequest =
+                GET(categoryUrl, headers)
+            val categoryMangaListResponse =
+                client.newCall(categoryMangaListRequest).execute()
+            val categoryMangaListJson =
+                categoryMangaListResponse.body.string()
+            val categoryMangaList =
+                json.decodeFromString<List<MangaDataClass>>(categoryMangaListJson)
+            mangaList.addAll(categoryMangaList)
+        }
+
+        // Filter according to search terms.
+        // Basic substring search, room for improvement.
+        var searchResults = if (!searchQuery.isNullOrEmpty()) {
+            mangaList.filter { mangaData ->
                 val fieldsToCheck = listOfNotNull(
                     mangaData.title,
                     mangaData.url,
@@ -231,22 +242,18 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
                     field.contains(searchQuery, ignoreCase = true)
                 }
             }.distinct()
-
-            // Construct new response with search results
-            val jsonString = json.encodeToString(searchResults)
-            val mediaType = "application/json".toMediaType()
-            val responseBody = jsonString.toResponseBody(mediaType)
-            Response.Builder()
-                .request(request)
-                .protocol(response.protocol)
-                .code(200)
-                .body(responseBody)
-                .message("OK")
-                .build()
         } else {
-            response
+            mangaList
         }
-        return popularMangaParse(newResponse)
+
+        // Paginate results
+        val hasNextPage: Boolean
+        with(paginateResults(searchResults, page, resultsPerPage)) {
+            searchResults = first
+            hasNextPage = second
+        }
+
+        return MangasPage(searchResults.map { mangaData -> mangaData.toSManga() }, hasNextPage)
     }
 
     // ------------- Images -------------
@@ -359,4 +366,17 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
 
     private val checkedBaseUrl: String
         get(): String = baseUrl.ifEmpty { throw RuntimeException("Set Tachidesk server url in extension settings") }
+
+    private fun paginateResults(mangaList: List<MangaDataClass>, page: Int?, itemsPerPage: Int?): Pair<List<MangaDataClass>, Boolean> {
+        var hasNextPage = false
+        val pageItems = if (mangaList.isNotEmpty() && itemsPerPage is Int && page is Int) {
+            val fromIndex = (page - 1) * itemsPerPage
+            val toIndex = min(fromIndex + itemsPerPage, mangaList.size)
+            hasNextPage = toIndex < mangaList.size
+            mangaList.subList(fromIndex, toIndex)
+        } else {
+            mangaList
+        }
+        return Pair(pageItems, hasNextPage)
+    }
 }
