@@ -35,6 +35,7 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
 import kotlin.math.min
+import kotlin.reflect.KProperty1
 
 class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     override val name = "Suwayomi"
@@ -118,27 +119,39 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     // ------------- Filters & Search -------------
 
     private var categoryList: List<CategoryDataClass> = emptyList()
-
     private val defaultCategoryId: Int
         get() = categoryList.firstOrNull()?.id ?: 0
 
     private val resultsPerPageOptions = listOf(10, 15, 20, 25)
-
     private val defaultResultsPerPage = resultsPerPageOptions.first()
+
+    private val sortByOptions = listOf(
+        "Title" to MangaDataClass::title,
+        "Artist" to MangaDataClass::artist,
+        "Author" to MangaDataClass::author,
+        "Date added" to MangaDataClass::inLibraryAt,
+        "Total chapters" to MangaDataClass::chapterCount,
+//        "Unread chapters (remote)" to MangaDataClass::unreadCount,
+    )
+    private val defaultSortByIndex = 0
 
     class CategorySelect(categoryList: List<CategoryDataClass>) :
         Filter.Select<String>("Category", categoryList.map { it.name }.toTypedArray())
 
-    class DisableGlobalSearch() :
+    class DisableGlobalSearch :
         Filter.CheckBox("Search only current category", false)
 
     class ResultsPerPageSelect(options: List<Int>) :
         Filter.Select<Int>("Results per page", options.toTypedArray())
 
+    class SortBy(options: List<Pair<String, KProperty1<MangaDataClass, Any?>>>) :
+        Filter.Sort("Sort by", options.map { it.first }.toTypedArray(), Selection(0, true))
+
     override fun getFilterList(): FilterList =
         FilterList(
             CategorySelect(refreshCategoryList(baseUrl).let { categoryList }),
             Filter.Header("Press reset to attempt to fetch categories"),
+            SortBy(sortByOptions),
             DisableGlobalSearch(),
             ResultsPerPageSelect(resultsPerPageOptions),
         )
@@ -166,11 +179,17 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
         var currentCategoryId = defaultCategoryId
         var disableGlobalSearch = false
         var resultsPerPage = defaultResultsPerPage
+        var sortByIndex = defaultSortByIndex
+        var sortByAscending = true
         filters.forEach { filter ->
             when (filter) {
                 is CategorySelect -> currentCategoryId = categoryList[filter.state].id
                 is DisableGlobalSearch -> disableGlobalSearch = filter.state
                 is ResultsPerPageSelect -> resultsPerPage = resultsPerPageOptions[filter.state]
+                is SortBy -> {
+                    sortByIndex = filter.state?.index ?: sortByIndex
+                    sortByAscending = filter.state?.ascending ?: sortByAscending
+                }
                 else -> {}
             }
         }
@@ -179,6 +198,8 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
             .newBuilder()
             .addQueryParameter("searchQuery", query)
             .addQueryParameter("currentCategoryId", currentCategoryId.toString())
+            .addQueryParameter("sortBy", sortByIndex.toString())
+            .addQueryParameter("sortByAscending", sortByAscending.toString())
             .addQueryParameter("disableGlobalSearch", disableGlobalSearch.toString())
             .addQueryParameter("resultsPerPage", resultsPerPage.toString())
             .addQueryParameter("page", page.toString())
@@ -190,6 +211,8 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
         val request = response.request
         var searchQuery: String? = ""
         var currentCategoryId: Int? = defaultCategoryId
+        var sortByIndex = defaultSortByIndex
+        var sortByAscending = true
         var disableGlobalSearch = false
         var resultsPerPage: Int? = defaultResultsPerPage
         var page: Int? = 1
@@ -198,10 +221,13 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
         if (!request.url.query.isNullOrEmpty()) {
             searchQuery = request.url.queryParameter("searchQuery")
             currentCategoryId = request.url.queryParameter("currentCategoryId")?.toIntOrNull()
+            sortByIndex = request.url.queryParameter("sortBy").toString().toIntOrNull() ?: sortByIndex
+            sortByAscending = request.url.queryParameter("sortByAscending").toBoolean()
             disableGlobalSearch = request.url.queryParameter("disableGlobalSearch").toBoolean()
             resultsPerPage = request.url.queryParameter("resultsPerPage")?.toIntOrNull()
             page = request.url.queryParameter("page")?.toIntOrNull()
         }
+        val sortByProperty = sortByOptions[sortByIndex].second
 
         // Get URLs of categories to search
         val categoryUrlList = if (!disableGlobalSearch && !searchQuery.isNullOrEmpty()) {
@@ -243,7 +269,15 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
                 }
             }.distinct()
         } else {
-            mangaList
+            mangaList.distinct()
+        }
+
+        // Sort results
+        searchResults = searchResults.sortedBy { mangaData ->
+            (sortByProperty.get(mangaData) ?: 0) as Comparable<Any>
+        }
+        if (!sortByAscending) {
+            searchResults = searchResults.asReversed()
         }
 
         // Paginate results

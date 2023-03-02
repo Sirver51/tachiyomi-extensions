@@ -39,8 +39,11 @@ data class MangaDataClass(
     val genre: List<String> = emptyList(),
     val status: String = "UNKNOWN",
     val inLibrary: Boolean = false,
+    val inLibraryAt: Int = 0,
     val source: SourceDataClass? = null,
     val meta: Map<String, String> = emptyMap(),
+//    val unreadCount: Int? = 0,
+    val chapterCount: Int? = 0,
 
     val realUrl: String? = null,
 
