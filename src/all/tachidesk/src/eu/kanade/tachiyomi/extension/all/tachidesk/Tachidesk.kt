@@ -138,9 +138,6 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     class CategorySelect(categoryList: List<CategoryDataClass>) :
         Filter.Select<String>("Category", categoryList.map { it.name }.toTypedArray())
 
-    class DisableGlobalSearch :
-        Filter.CheckBox("Search only current category", false)
-
     class ResultsPerPageSelect(options: List<Int>) :
         Filter.Select<Int>("Results per page", options.toTypedArray())
 
@@ -149,10 +146,11 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
 
     override fun getFilterList(): FilterList =
         FilterList(
+            Filter.Header("Press reset to attempt to fetch categories."),
+            Filter.Header("\"All\" shows all manga regardless of category."),
             CategorySelect(refreshCategoryList(baseUrl).let { categoryList }),
-            Filter.Header("Press reset to attempt to fetch categories"),
+            Filter.Separator(),
             SortBy(sortByOptions),
-            DisableGlobalSearch(),
             ResultsPerPageSelect(resultsPerPageOptions),
         )
 
@@ -165,7 +163,9 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
             .subscribe(
                 { response ->
                     categoryList = try {
-                        json.decodeFromString<List<CategoryDataClass>>(response.body.string())
+                        // Add a pseudo category to list all manga across all categories
+                        listOf(CategoryDataClass(-1, -1, "All", false)) +
+                            json.decodeFromString<List<CategoryDataClass>>(response.body.string())
                     } catch (e: Exception) {
                         emptyList()
                     }
@@ -177,14 +177,12 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         // Embed search query and scope into URL params for processing in searchMangaParse
         var currentCategoryId = defaultCategoryId
-        var disableGlobalSearch = false
         var resultsPerPage = defaultResultsPerPage
         var sortByIndex = defaultSortByIndex
         var sortByAscending = true
         filters.forEach { filter ->
             when (filter) {
                 is CategorySelect -> currentCategoryId = categoryList[filter.state].id
-                is DisableGlobalSearch -> disableGlobalSearch = filter.state
                 is ResultsPerPageSelect -> resultsPerPage = resultsPerPageOptions[filter.state]
                 is SortBy -> {
                     sortByIndex = filter.state?.index ?: sortByIndex
@@ -200,7 +198,6 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
             .addQueryParameter("currentCategoryId", currentCategoryId.toString())
             .addQueryParameter("sortBy", sortByIndex.toString())
             .addQueryParameter("sortByAscending", sortByAscending.toString())
-            .addQueryParameter("disableGlobalSearch", disableGlobalSearch.toString())
             .addQueryParameter("resultsPerPage", resultsPerPage.toString())
             .addQueryParameter("page", page.toString())
             .build()
@@ -210,31 +207,26 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     override fun searchMangaParse(response: Response): MangasPage {
         val request = response.request
         var searchQuery: String? = ""
-        var currentCategoryId: Int? = defaultCategoryId
+        var currentCategoryId = defaultCategoryId
         var sortByIndex = defaultSortByIndex
         var sortByAscending = true
-        var disableGlobalSearch = false
-        var resultsPerPage: Int? = defaultResultsPerPage
-        var page: Int? = 1
+        var resultsPerPage = defaultResultsPerPage
+        var page = 1
 
         // Check if URL has query params and parse them
         if (!request.url.query.isNullOrEmpty()) {
             searchQuery = request.url.queryParameter("searchQuery")
-            currentCategoryId = request.url.queryParameter("currentCategoryId")?.toIntOrNull()
-            sortByIndex = request.url.queryParameter("sortBy").toString().toIntOrNull() ?: sortByIndex
+            currentCategoryId = request.url.queryParameter("currentCategoryId")?.toIntOrNull() ?: currentCategoryId
+            sortByIndex = request.url.queryParameter("sortBy")?.toIntOrNull() ?: sortByIndex
             sortByAscending = request.url.queryParameter("sortByAscending").toBoolean()
-            disableGlobalSearch = request.url.queryParameter("disableGlobalSearch").toBoolean()
-            resultsPerPage = request.url.queryParameter("resultsPerPage")?.toIntOrNull()
-            page = request.url.queryParameter("page")?.toIntOrNull()
+            resultsPerPage = request.url.queryParameter("resultsPerPage")?.toIntOrNull() ?: resultsPerPage
+            page = request.url.queryParameter("page")?.toIntOrNull() ?: page
         }
         val sortByProperty = sortByOptions[sortByIndex].second
 
         // Get URLs of categories to search
-        val categoryUrlList = if (!disableGlobalSearch && !searchQuery.isNullOrEmpty()) {
-            categoryList.map { category ->
-                val categoryId = category.id
-                "$checkedBaseUrl/api/v1/category/$categoryId"
-            }
+        val categoryUrlList = if (currentCategoryId == -1) {
+            categoryList.map { category -> "$checkedBaseUrl/api/v1/category/${category.id}" }
         } else {
             listOfNotNull("$checkedBaseUrl/api/v1/category/$currentCategoryId")
         }
@@ -267,10 +259,10 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
                 fieldsToCheck.any { field ->
                     field.contains(searchQuery, ignoreCase = true)
                 }
-            }.distinct()
+            }
         } else {
-            mangaList.distinct()
-        }
+            mangaList
+        }.distinct()
 
         // Sort results
         searchResults = searchResults.sortedBy { mangaData ->
