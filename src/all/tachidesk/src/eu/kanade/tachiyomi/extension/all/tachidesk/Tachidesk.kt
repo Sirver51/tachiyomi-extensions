@@ -27,6 +27,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.internal.toImmutableList
 import rx.Observable
 import rx.Single
 import rx.android.schedulers.AndroidSchedulers
@@ -105,7 +106,7 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
         return GET("$checkedBaseUrl/api/v1/manga/$mangaId/chapter/$chapterIndex/?onlineFetch=True", headers)
     }
 
-    fun pageListParse(response: Response, sChapter: SChapter): List<Page> {
+    private fun pageListParse(response: Response, sChapter: SChapter): List<Page> {
         val mangaId = sChapter.url.split(" ").first()
         val chapterIndex = sChapter.url.split(" ").last()
 
@@ -135,6 +136,15 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     )
     private val defaultSortByIndex = 0
 
+    private var tagList: List<String> = emptyList()
+    private val tagModeAndString = "AND"
+    private val tagModeOrString = "OR"
+    private val tagModes = listOf(tagModeAndString, tagModeOrString)
+    private val defaultIncludeTagModeIndex = tagModes.indexOf(tagModeAndString)
+    private val defaultExcludeTagModeIndex = tagModes.indexOf(tagModeOrString)
+    private val tagFilterModeIncludeString = "Include"
+    private val tagFilterModeExcludeString = "Exclude"
+
     class CategorySelect(categoryList: List<CategoryDataClass>) :
         Filter.Select<String>("Category", categoryList.map { it.name }.toTypedArray())
 
@@ -142,17 +152,56 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
         Filter.Select<Int>("Results per page", options.toTypedArray())
 
     class SortBy(options: List<Pair<String, KProperty1<MangaDataClass, Any?>>>) :
-        Filter.Sort("Sort by", options.map { it.first }.toTypedArray(), Selection(0, true))
-
-    override fun getFilterList(): FilterList =
-        FilterList(
-            Filter.Header("Press reset to attempt to fetch categories."),
-            Filter.Header("\"All\" shows all manga regardless of category."),
-            CategorySelect(refreshCategoryList(baseUrl).let { categoryList }),
-            Filter.Separator(),
-            SortBy(sortByOptions),
-            ResultsPerPageSelect(resultsPerPageOptions),
+        Filter.Sort(
+            "Sort by",
+            options.map { it.first }.toTypedArray(),
+            Selection(0, true),
         )
+
+    class Tag(name: String, state: Int) :
+        Filter.TriState(name, state)
+
+    class TagFilterMode(type: String, tagModes: List<String>, defaultIndex: Int = 0) :
+        Filter.Select<String>(type, tagModes.toTypedArray(), defaultIndex)
+
+    class TagSelector(tagList: List<String>) :
+        Filter.Group<Tag>(
+            "Tags",
+            tagList.map { tag -> Tag(tag, 0) },
+        )
+
+    class TagFilterModeGroup(
+        tagModes: List<String>,
+        includeString: String,
+        excludeString: String,
+        includeDefaultIndex: Int = 0,
+        excludeDefaultIndex: Int = 0,
+    ) :
+        Filter.Group<TagFilterMode>(
+            "Tag Filter Modes",
+            listOf(
+                TagFilterMode(includeString, tagModes, includeDefaultIndex),
+                TagFilterMode(excludeString, tagModes, excludeDefaultIndex),
+            ),
+        )
+
+    override fun getFilterList(): FilterList = FilterList(
+        Filter.Header("Press reset to refresh tag list and attempt to fetch categories."),
+        Filter.Header("Tag list shows only the tags of currently displayed manga."),
+        Filter.Header("\"All\" shows all manga regardless of category."),
+        CategorySelect(refreshCategoryList(baseUrl).let { categoryList }),
+        Filter.Separator(),
+        TagFilterModeGroup(
+            tagModes,
+            tagFilterModeIncludeString,
+            tagFilterModeExcludeString,
+            defaultIncludeTagModeIndex,
+            defaultExcludeTagModeIndex,
+        ),
+        TagSelector(tagList),
+        SortBy(sortByOptions),
+        ResultsPerPageSelect(resultsPerPageOptions),
+    )
 
     private fun refreshCategoryList(baseUrl: String) {
         Single.fromCallable {
@@ -174,12 +223,27 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
             )
     }
 
+    private fun refreshTagList(mangaList: List<MangaDataClass>) {
+        val newTagList = mutableListOf<String>()
+        for (mangaDetails in mangaList) {
+            newTagList.addAll(mangaDetails.genre)
+        }
+        tagList = newTagList
+            .distinctBy { tag -> tag.lowercase() }
+            .sortedBy { tag -> tag.lowercase() }
+            .filter { tag -> tag.trim() != "" }
+    }
+
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         // Embed search query and scope into URL params for processing in searchMangaParse
         var currentCategoryId = defaultCategoryId
         var resultsPerPage = defaultResultsPerPage
         var sortByIndex = defaultSortByIndex
         var sortByAscending = true
+        val tagIncludeList = mutableListOf<String>()
+        val tagExcludeList = mutableListOf<String>()
+        var tagFilterIncludeModeIndex = defaultIncludeTagModeIndex
+        var tagFilterExcludeModeIndex = defaultExcludeTagModeIndex
         filters.forEach { filter ->
             when (filter) {
                 is CategorySelect -> currentCategoryId = categoryList[filter.state].id
@@ -187,6 +251,22 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
                 is SortBy -> {
                     sortByIndex = filter.state?.index ?: sortByIndex
                     sortByAscending = filter.state?.ascending ?: sortByAscending
+                }
+                is TagFilterModeGroup -> {
+                    filter.state.forEach { tagFilterMode ->
+                        when (tagFilterMode.name) {
+                            tagFilterModeIncludeString -> tagFilterIncludeModeIndex = tagFilterMode.state
+                            tagFilterModeExcludeString -> tagFilterExcludeModeIndex = tagFilterMode.state
+                        }
+                    }
+                }
+                is TagSelector -> {
+                    filter.state.forEach { tagFilter ->
+                        when {
+                            tagFilter.isIncluded() -> tagIncludeList.add(tagFilter.name)
+                            tagFilter.isExcluded() -> tagExcludeList.add(tagFilter.name)
+                        }
+                    }
                 }
                 else -> {}
             }
@@ -198,6 +278,10 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
             .addQueryParameter("currentCategoryId", currentCategoryId.toString())
             .addQueryParameter("sortBy", sortByIndex.toString())
             .addQueryParameter("sortByAscending", sortByAscending.toString())
+            .addQueryParameter("tagFilterIncludeMode", tagFilterIncludeModeIndex.toString())
+            .addQueryParameter("tagFilterExcludeMode", tagFilterExcludeModeIndex.toString())
+            .addQueryParameter("tagIncludeList", tagIncludeList.joinToString(","))
+            .addQueryParameter("tagExcludeList", tagExcludeList.joinToString(","))
             .addQueryParameter("resultsPerPage", resultsPerPage.toString())
             .addQueryParameter("page", page.toString())
             .build()
@@ -210,6 +294,10 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
         var currentCategoryId = defaultCategoryId
         var sortByIndex = defaultSortByIndex
         var sortByAscending = true
+        var tagIncludeList = mutableListOf<String>()
+        var tagExcludeList = mutableListOf<String>()
+        var tagFilterIncludeModeIndex = defaultIncludeTagModeIndex
+        var tagFilterExcludeModeIndex = defaultExcludeTagModeIndex
         var resultsPerPage = defaultResultsPerPage
         var page = 1
 
@@ -219,10 +307,28 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
             currentCategoryId = request.url.queryParameter("currentCategoryId")?.toIntOrNull() ?: currentCategoryId
             sortByIndex = request.url.queryParameter("sortBy")?.toIntOrNull() ?: sortByIndex
             sortByAscending = request.url.queryParameter("sortByAscending").toBoolean()
+            tagIncludeList = request.url.queryParameter("tagIncludeList").let { param ->
+                if (param is String && param.isNotEmpty()) {
+                    param.split(",").toMutableList()
+                } else {
+                    tagIncludeList
+                }
+            }
+            tagExcludeList = request.url.queryParameter("tagExcludeList").let { param ->
+                if (param is String && param.isNotEmpty()) {
+                    param.split(",").toMutableList()
+                } else {
+                    tagExcludeList
+                }
+            }
+            tagFilterIncludeModeIndex = request.url.queryParameter("tagFilterIncludeMode")?.toIntOrNull() ?: tagFilterIncludeModeIndex
+            tagFilterExcludeModeIndex = request.url.queryParameter("tagFilterExcludeMode")?.toIntOrNull() ?: tagFilterExcludeModeIndex
             resultsPerPage = request.url.queryParameter("resultsPerPage")?.toIntOrNull() ?: resultsPerPage
             page = request.url.queryParameter("page")?.toIntOrNull() ?: page
         }
         val sortByProperty = sortByOptions[sortByIndex].second
+        val tagFilterIncludeMode = tagModes[tagFilterIncludeModeIndex]
+        val tagFilterExcludeMode = tagModes[tagFilterExcludeModeIndex]
 
         // Get URLs of categories to search
         val categoryUrlList = if (currentCategoryId == -1) {
@@ -245,10 +351,30 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
             mangaList.addAll(categoryMangaList)
         }
 
+        // Filter by tags
+        var searchResults = mangaList.toImmutableList()
+        val filterConfigs = mutableListOf<Triple<Boolean, String, List<String>>>()
+        if (tagExcludeList.isNotEmpty()) filterConfigs.add(Triple(false, tagFilterExcludeMode, tagExcludeList))
+        if (tagIncludeList.isNotEmpty()) filterConfigs.add(Triple(true, tagFilterIncludeMode, tagIncludeList))
+        filterConfigs.forEach { config ->
+            val isInclude = config.first
+            val filterMode = config.second
+            val filteredTagList = config.third
+            searchResults = searchResults.filter { mangaData ->
+                val lowerCaseTags = mangaData.genre.map { it.lowercase() }
+                val filterResult = when (filterMode) {
+                    tagModeAndString -> lowerCaseTags.containsAll(filteredTagList.map { tag -> tag.lowercase() })
+                    tagModeOrString -> lowerCaseTags.any { tag -> tag in filteredTagList.map { tag -> tag.lowercase() } }
+                    else -> false
+                }
+                if (isInclude) filterResult else !filterResult
+            }
+        }
+
         // Filter according to search terms.
         // Basic substring search, room for improvement.
-        var searchResults = if (!searchQuery.isNullOrEmpty()) {
-            mangaList.filter { mangaData ->
+        searchResults = if (!searchQuery.isNullOrEmpty()) {
+            searchResults.filter { mangaData ->
                 val fieldsToCheck = listOfNotNull(
                     mangaData.title,
                     mangaData.url,
@@ -261,7 +387,7 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
                 }
             }
         } else {
-            mangaList
+            searchResults
         }.distinct()
 
         // Sort results
@@ -271,6 +397,9 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
         if (!sortByAscending) {
             searchResults = searchResults.asReversed()
         }
+
+        // Get new list of tags from the search results
+        refreshTagList(searchResults)
 
         // Paginate results
         val hasNextPage: Boolean
