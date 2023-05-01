@@ -42,7 +42,6 @@ data class MangaDataClass(
     val inLibraryAt: Int = 0,
     val source: SourceDataClass? = null,
     val meta: Map<String, String> = emptyMap(),
-//    val unreadCount: Int? = 0,
     val chapterCount: Int? = 0,
 
     val realUrl: String? = null,

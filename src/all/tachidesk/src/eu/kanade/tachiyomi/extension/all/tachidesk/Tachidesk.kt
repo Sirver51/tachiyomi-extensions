@@ -36,7 +36,6 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
 import kotlin.math.min
-import kotlin.reflect.KProperty1
 
 class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     override val name = "Suwayomi"
@@ -127,12 +126,11 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     private val defaultResultsPerPage = resultsPerPageOptions.first()
 
     private val sortByOptions = listOf(
-        "Title" to MangaDataClass::title,
-        "Artist" to MangaDataClass::artist,
-        "Author" to MangaDataClass::author,
-        "Date added" to MangaDataClass::inLibraryAt,
-        "Total chapters" to MangaDataClass::chapterCount,
-//        "Unread chapters (remote)" to MangaDataClass::unreadCount,
+        "Title",
+        "Artist",
+        "Author",
+        "Date added",
+        "Total chapters",
     )
     private val defaultSortByIndex = 0
 
@@ -151,10 +149,10 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
     class ResultsPerPageSelect(options: List<Int>) :
         Filter.Select<Int>("Results per page", options.toTypedArray())
 
-    class SortBy(options: List<Pair<String, KProperty1<MangaDataClass, Any?>>>) :
+    class SortBy(options: List<String>) :
         Filter.Sort(
             "Sort by",
-            options.map { it.first }.toTypedArray(),
+            options.toTypedArray(),
             Selection(0, true),
         )
 
@@ -326,7 +324,7 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
             resultsPerPage = request.url.queryParameter("resultsPerPage")?.toIntOrNull() ?: resultsPerPage
             page = request.url.queryParameter("page")?.toIntOrNull() ?: page
         }
-        val sortByProperty = sortByOptions[sortByIndex].second
+        val sortByProperty = sortByOptions[sortByIndex]
         val tagFilterIncludeMode = tagModes[tagFilterIncludeModeIndex]
         val tagFilterExcludeMode = tagModes[tagFilterExcludeModeIndex]
 
@@ -391,8 +389,13 @@ class Tachidesk : ConfigurableSource, UnmeteredSource, HttpSource() {
         }.distinct()
 
         // Sort results
-        searchResults = searchResults.sortedBy { mangaData ->
-            (sortByProperty.get(mangaData) ?: 0) as Comparable<Any>
+        searchResults = when (sortByProperty) {
+            "Title" -> searchResults.sortedBy { it.title }
+            "Artist" -> searchResults.sortedBy { it.artist }
+            "Author" -> searchResults.sortedBy { it.author }
+            "Date added" -> searchResults.sortedBy { it.inLibraryAt }
+            "Total chapters" -> searchResults.sortedBy { it.chapterCount }
+            else -> searchResults
         }
         if (!sortByAscending) {
             searchResults = searchResults.asReversed()
